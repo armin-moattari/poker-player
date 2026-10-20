@@ -11,10 +11,10 @@ Work in progress. See [CLAUDE.md](CLAUDE.md) for the full plan and milestones.
 | `internal/card` | Cards, parsing (`"As"`, `"Td"`), and a seedable deck | Done |
 | `internal/eval` | Ranks any 5 to 7 cards; fast bitmask evaluator plus a naive reference | Done |
 | `internal/equity` | Exact and Monte Carlo equity, heads-up or multiway, across all cores | Done |
-| `internal/advisor` | Recommends fold, call or raise for your spot, with the reasoning | Planned |
+| `internal/advisor` | Recommends fold, check, call, bet or raise for your spot, with the reasoning; fully customizable | Done |
 | `internal/game` | Plays heads-up no-limit hands (blinds, four streets, showdown) and matches | Planned |
 | `internal/bot` | `RandomBot` and `EquityBot` that play the game engine | Planned |
-| `cmd/cli` | Command-line front end for the advisor, equity and bot matches | Planned |
+| `cmd/cli` | Command-line front end: `advise` and `equity` done, bot matches planned | In progress |
 | `wasm`, `web` | Web GUI for the advisor and equity, installable as an app | Planned |
 
 ## Quick start
@@ -26,6 +26,117 @@ go test ./...                       # all tests, including exhaustive all-hands 
 go test -short ./...                # quick run that skips the exhaustive checks
 go test -bench=. ./internal/...      # evaluator and equity benchmarks
 go doc ./internal/eval              # package documentation
+```
+
+## Hand advisor (`internal/advisor`, `cmd/cli`)
+
+Pull it up mid-game to get a recommendation for your spot:
+
+```bash
+go run ./cmd/cli advise --hand "As Kd" --board "Qs Jh 2c" --pot 40 --to-call 10 --players 3 --position early
+```
+
+```
+Recommendation: CALL, putting in 10 chips
+  flop, holding high card, early position
+  win share vs random hands: 44% (fair share 33%)
+  pot odds: 20%; needed to call: 22%
+  why: you need 22% (pot odds 20%, adjusted for implied odds and early position) and win about 44%
+```
+
+The spot, entered for each hand:
+
+| Option | Meaning |
+| --- | --- |
+| `--hand` | your two cards (required) |
+| `--board` | community cards so far (leave out preflop); this also sets the betting round |
+| `--pot` | amount in the middle, including bets made this round |
+| `--to-call` | amount you must put in to call (0 if you can check) |
+| `--stack` | amount you have behind (optional; caps raises and calls) |
+| `--players` | players still in the hand, you included (default 2) |
+| `--position` | `early`, `middle` or `late` (optional) |
+| `--seed` | random seed; the same seed gives the same advice |
+
+**Amounts and units.** Amounts can be decimals in any unit (chips, dollars, big blinds), as long as they all use the same one. The advisor only compares amounts to each other, so the unit never changes the decision. It only changes how amounts are rounded and shown.
+
+**How it decides.** It estimates your equity against random opponent hands. If that's well above a fair share of the pot (1.4 times 1/players, capped at 90%), it bets or raises. If not, it checks when checking is free. Otherwise it calls when your equity beats the equity a call needs, and folds when it doesn't.
+- **Implied odds:** before the river, the equity a call needs is the pot odds lowered for chips you expect to win later when you hit.
+- **Position:** early position raises both the bet and the call thresholds, because players behind can still raise. Late position lowers them.
+- **Bet size:** bets after the flop are 75% of the pot. With a big blind set, preflop raises are 3x the current bet.
+- **Chip rounding:** every bet is rounded to your smallest chip.
+
+It doesn't model how real opponents play (they don't hold random hands) or their stack sizes, so treat it as a baseline.
+
+### Customizing the advisor
+
+Every setting lives in a settings file that you create once and edit:
+
+```bash
+go run ./cmd/cli config --init   # writes the defaults and prints where the file is
+go run ./cmd/cli config          # shows the file location and the settings in effect
+```
+
+The file only needs the settings you want to change. For a $1/$2 game with $0.25 chips and smaller bets:
+
+```json
+{ "unit": "$", "chip_step": 0.25, "big_blind": 2, "bet_fraction": 0.5 }
+```
+
+A setting flag on the command line overrides the file for that one hand, e.g. `--bet-size 1` for a pot-sized bet.
+
+| Setting (file / flag) | Default | What it does |
+| --- | --- | --- |
+| `unit` / `--unit` | `chips` | How amounts are shown: `"$"` gives `$12.50`, any other word gives `25 chips` |
+| `chip_step` / `--chip` | 1 | Smallest bet you can make; suggested bets are rounded to it |
+| `big_blind` / `--big-blind` | 0 (off) | Shows amounts in big blinds too, and sizes preflop raises |
+| `bet_fraction` / `--bet-size` | 0.75 | Bet size after the flop, as a fraction of the pot |
+| `preflop_raise` / `--preflop-raise` | 3 | Preflop raise size, times the current bet (needs a big blind) |
+| `implied_odds` / `--implied` | 0.25 | Extra you expect to win later when you hit, as a fraction of the pot (0 turns it off) |
+| `position_edge` / `--position-edge` | 0.05 | How far position moves the thresholds, 0 to 0.5 (0 turns it off) |
+| `strong_multiple` | 1.4 | How many times a fair share your equity needs to bet |
+| `strong_cap` | 0.9 | Upper limit on that bet threshold |
+| `trials` / `--trials` | 100,000 | Simulated deals per decision (more is more precise) |
+
+### Using the advisor from Go
+
+The library does no printing or flag parsing. It takes a `Spot` and a `Config` and returns an `Advice` struct, and `cmd/cli` only parses flags, reads the settings file and formats text. The web GUI will call the same `Advise` function.
+
+```go
+cfg := advisor.DefaultConfig()
+cfg.Unit, cfg.ChipStep, cfg.BigBlind = "$", 0.25, 2
+
+a, err := advisor.Advise(ctx, advisor.Spot{
+	Hand: hand, Board: board, Pot: 40, ToCall: 10, Players: 3, Position: advisor.Early, Seed: 1,
+}, cfg)
+// a.Action == advisor.Call, cfg.Money(a.Amount) == "$10.00 (5 BB)", a.HandName == "high card"
+// a.Equity ≈ 0.44, a.PotOdds == 0.2, a.Needed ≈ 0.22
+```
+
+| Name | What it does |
+| --- | --- |
+| `Advise(ctx, spot, cfg)` | Returns the recommendation; errors on an invalid spot or settings, or a cancelled `ctx` |
+| `Spot` | `Hand`, `Board`, `Pot`, `ToCall`, `Stack` (0 = ignore), `Players` (0 = 2), `Position`, `Seed` |
+| `Config`, `DefaultConfig()`, `c.Validate()` | The settings above, their defaults, and a range check |
+| `c.Money(amount)` | Formats an amount in the configured unit, with big blinds if set: `"$10.00 (5 BB)"` |
+| `ParsePosition(s)` | Parses `"early"`, `"middle"` or `"late"` |
+| `Advice.Action`, `Advice.Amount`, `Advice.AllIn` | What to do (`Fold`, `Check`, `Call`, `Bet`, `Raise`), how much to put in now, and whether that's your whole stack |
+| `Advice.Street`, `Advice.HandName` | The betting round, and your hand (`"AKs"` preflop, `"two pair"` after the flop) |
+| `Advice.Equity`, `Advice.FairShare` | Your equity against random hands, and 1/players |
+| `Advice.PotOdds`, `Advice.Needed`, `Advice.BetThreshold` | Plain pot odds, the equity actually needed to call, and the equity needed to bet |
+| `Advice.Reason` | One sentence explaining the recommendation |
+| `HoleName(hand)` | Shorthand for two hole cards: `"AKs"`, `"QJo"`, `"77"` |
+
+### Equity from the command line
+
+```bash
+go run ./cmd/cli equity --hands "AhAs KdKc"
+go run ./cmd/cli equity --hands "AsKd" --board "Qs Jh 2c" --opponents 2
+```
+
+```
+hand     equity      win      tie   (exact, 1712304 boards)
+Ah As    81.26%   81.06%    0.38%
+Kd Kc    18.74%   18.55%    0.38%
 ```
 
 ## Cards and deck (`internal/card`)
