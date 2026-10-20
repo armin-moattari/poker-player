@@ -6,13 +6,15 @@
 // stronger hand and equal values mean a split pot. Comparing hands is then just
 // comparing numbers, which keeps showdown and equity code simple and fast.
 //
-// This is the straightforward ("naive") evaluator. It is written for clarity
-// and serves as the reference that a faster lookup-table evaluator will be
-// tested against.
+// Evaluate uses a bitmask method (see its doc comment) and ranks a 7-card
+// hand in about 30 ns with no allocations. naive.go keeps the original
+// try-every-combination evaluator, about 60 times slower, as the reference
+// the fast one is tested against. Benchmark numbers are in the README.
 package eval
 
 import (
 	"fmt"
+	"math/bits"
 	"strings"
 
 	"github.com/armin-moattari/poker-player/internal/card"
@@ -120,121 +122,133 @@ func makeRank(c Category, ranks ...card.Rank) HandRank {
 	return h
 }
 
-// Evaluate5 returns the rank of exactly five cards. The cards must be
-// distinct; the order they are passed in does not matter.
+// Evaluate5 returns the rank of exactly five cards. It is a convenience
+// wrapper around Evaluate for callers that hold a fixed-size array.
 func Evaluate5(cards [5]card.Card) HandRank {
-	// counts[r] is how many cards of rank r the hand holds. Index by rank
-	// directly (2..14) and waste a couple of slots, which is simpler than
-	// subtracting 2 everywhere.
-	var counts [card.Ace + 1]int
-	// rankMask has bit r set for each rank present, used to spot straights.
-	var rankMask uint16
-	flush := true
-	for i, c := range cards {
-		counts[c.Rank()]++
-		rankMask |= 1 << c.Rank()
-		if i > 0 && c.Suit() != cards[0].Suit() {
-			flush = false
-		}
-	}
-
-	// A straight needs five different ranks, so check that first.
-	if high, ok := straightHigh(rankMask); ok {
-		if flush {
-			return makeRank(StraightFlush, high)
-		}
-		return makeRank(Straight, high)
-	}
-
-	// Group ranks by how many times they appear. Walking from Ace down to
-	// Two and filling one list per count gives each list in descending
-	// rank order, which is exactly the tie-break order poker uses within a
-	// group (e.g. the higher of two pairs comes first).
-	var quads, trips, pairs, singles []card.Rank
-	for r := card.Ace; r >= card.Two; r-- {
-		switch counts[r] {
-		case 4:
-			quads = append(quads, r)
-		case 3:
-			trips = append(trips, r)
-		case 2:
-			pairs = append(pairs, r)
-		case 1:
-			singles = append(singles, r)
-		}
-	}
-
-	switch {
-	case len(quads) == 1:
-		return makeRank(FourOfAKind, quads[0], singles[0])
-	case len(trips) == 1 && len(pairs) == 1:
-		return makeRank(FullHouse, trips[0], pairs[0])
-	case flush:
-		// No pairs are possible in a flush (same suit, distinct cards),
-		// so all five cards are singles, already sorted high to low.
-		return makeRank(Flush, singles...)
-	case len(trips) == 1:
-		return makeRank(ThreeOfAKind, trips[0], singles[0], singles[1])
-	case len(pairs) == 2:
-		return makeRank(TwoPair, pairs[0], pairs[1], singles[0])
-	case len(pairs) == 1:
-		return makeRank(OnePair, pairs[0], singles[0], singles[1], singles[2])
-	default:
-		return makeRank(HighCard, singles...)
-	}
-}
-
-// wheelMask is the rank mask of A-2-3-4-5, the lowest straight, where the
-// ace plays low.
-const wheelMask = 1<<card.Ace | 1<<card.Two | 1<<card.Three | 1<<card.Four | 1<<card.Five
-
-// straightHigh reports whether the ranks in mask form a five-card straight
-// and, if so, returns its top card. mask must hold exactly five ranks.
-func straightHigh(mask uint16) (card.Rank, bool) {
-	// Five consecutive set bits, shifted so the lowest is bit 0, equal
-	// 0b11111. Checking each possible top card from Ace down is simple and
-	// fast enough for this reference evaluator.
-	for high := card.Ace; high >= card.Six; high-- {
-		if mask == 0b11111<<(high-4) {
-			return high, true
-		}
-	}
-	// The wheel counts as a five-high straight, so it loses to 6-high.
-	if mask == wheelMask {
-		return card.Five, true
-	}
-	return 0, false
+	return Evaluate(cards[:])
 }
 
 // Evaluate returns the rank of the best five-card hand that can be made from
 // cards, which must hold between five and seven distinct cards. It panics
 // otherwise, since a wrong count is a programming error, not bad input.
 //
-// It tries every five-card combination (21 of them for seven cards) and keeps
-// the strongest. That is easy to verify but slow; milestone 4 replaces it with
-// a faster evaluator and uses this one to check the results.
+// Instead of trying every five-card combination (21 for seven cards), it
+// looks at all the cards at once using bitmasks: one 16-bit mask per suit,
+// where bit r is set if that suit holds a card of rank r. Flushes, straights,
+// pairs, trips and quads can all be read off those four masks with a handful
+// of bitwise operations, and there are no loops over combinations, no
+// allocations and no lookup tables to build.
 func Evaluate(cards []card.Card) HandRank {
-	n := len(cards)
-	if n < 5 || n > 7 {
+	if n := len(cards); n < 5 || n > 7 {
 		panic(fmt.Sprintf("eval: Evaluate needs 5 to 7 cards, got %d", n))
 	}
-	var best HandRank
-	// Five nested loops pick indexes a < b < c < d < e, which visits every
-	// five-card combination exactly once. Plain loops are easier to check
-	// than a general combinations helper, and n is at most 7.
-	for a := 0; a < n; a++ {
-		for b := a + 1; b < n; b++ {
-			for c := b + 1; c < n; c++ {
-				for d := c + 1; d < n; d++ {
-					for e := d + 1; e < n; e++ {
-						hand := [5]card.Card{cards[a], cards[b], cards[c], cards[d], cards[e]}
-						if r := Evaluate5(hand); r > best {
-							best = r
-						}
-					}
-				}
+
+	// suits[s] has bit r set when the hand holds rank r in suit s.
+	var suits [4]uint16
+	for _, c := range cards {
+		suits[c.Suit()] |= 1 << c.Rank()
+	}
+
+	// Flush check. With at most seven cards, a hand that holds a flush
+	// cannot also hold four of a kind or a full house (both would need more
+	// than seven cards), so the flush suit alone decides the hand.
+	for _, m := range suits {
+		if bits.OnesCount16(m) >= 5 {
+			if high, ok := straightTop(m); ok {
+				return makeRank(StraightFlush, high)
 			}
+			return addTop(makeRank(Flush), 0, m, 5)
 		}
 	}
-	return best
+
+	// Sort every rank into exactly one of four disjoint masks by how many
+	// times it appears: ones, twos, threes, fours. Each suit mask adds at
+	// most one card to each rank, so feeding the masks in one at a time
+	// moves a rank up by one level whenever its bit is set. All four new
+	// values are computed from the old ones, which is why they are
+	// assigned in a single statement.
+	var ones, twos, threes, fours uint16
+	for _, m := range suits {
+		ones, twos, threes, fours =
+			(ones&^m)|(m&^(ones|twos|threes|fours)),
+			(twos&^m)|(ones&m),
+			(threes&^m)|(twos&m),
+			fours|(threes&m)
+	}
+	all := ones | twos | threes | fours // every rank present at least once
+
+	switch {
+	case fours != 0:
+		quad := topBit(fours)
+		return makeRank(FourOfAKind, quad, topBit(all&^(1<<quad)))
+
+	case threes != 0 && bits.OnesCount16(threes)+bits.OnesCount16(twos) >= 2:
+		// Full house: the best trips, plus the best pair from what is
+		// left. A second set of trips counts as a pair here (KKK 777 x
+		// plays as kings full of sevens).
+		trip := topBit(threes)
+		return makeRank(FullHouse, trip, topBit((threes&^(1<<trip))|twos))
+	}
+
+	if high, ok := straightTop(all); ok {
+		return makeRank(Straight, high)
+	}
+
+	switch {
+	case threes != 0:
+		trip := topBit(threes)
+		return addTop(makeRank(ThreeOfAKind, trip), 1, all&^(1<<trip), 2)
+
+	case bits.OnesCount16(twos) >= 2:
+		// With three pairs, the lowest pair can still be the kicker,
+		// so the kicker comes from every rank except the two used.
+		hi := topBit(twos)
+		lo := topBit(twos &^ (1 << hi))
+		return makeRank(TwoPair, hi, lo, topBit(all&^(1<<hi|1<<lo)))
+
+	case twos != 0:
+		pair := topBit(twos)
+		return addTop(makeRank(OnePair, pair), 1, all&^(1<<pair), 3)
+
+	default:
+		return addTop(makeRank(HighCard), 0, all, 5)
+	}
+}
+
+// topBit returns the highest rank set in mask, which must not be zero.
+// bits.Len16 gives the position of the highest set bit plus one.
+func topBit(mask uint16) card.Rank {
+	return card.Rank(bits.Len16(mask) - 1)
+}
+
+// addTop writes the n highest ranks in mask into h, starting at tie-break
+// slot (0 is the most important slot). Writing straight into the HandRank,
+// rather than building a slice of ranks first, keeps Evaluate free of heap
+// allocations.
+func addTop(h HandRank, slot int, mask uint16, n int) HandRank {
+	for i := 0; i < n && mask != 0; i++ {
+		r := topBit(mask)
+		h |= HandRank(r) << ((maxTiebreaks - 1 - slot - i) * rankBits)
+		mask &^= 1 << r
+	}
+	return h
+}
+
+// straightTop reports whether mask holds five consecutive ranks and returns
+// the top rank of the highest such run. mask may hold more than five ranks.
+func straightTop(mask uint16) (card.Rank, bool) {
+	// An ace can also play low, below the two. Bit 1 is unused by real
+	// ranks (they start at 2), so copy the ace there to let the wheel
+	// A-2-3-4-5 look like any other run of five.
+	if mask&(1<<card.Ace) != 0 {
+		mask |= 1 << 1
+	}
+	// ANDing the mask with itself shifted by 1, 2, 3 and 4 leaves a bit set
+	// only where that rank and the four ranks above it are all present.
+	// Each surviving bit marks the bottom card of a straight.
+	run := mask & (mask >> 1) & (mask >> 2) & (mask >> 3) & (mask >> 4)
+	if run == 0 {
+		return 0, false
+	}
+	return topBit(run) + 4, true
 }
