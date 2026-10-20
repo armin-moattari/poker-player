@@ -52,5 +52,5 @@ The advisor is a library, not a CLI feature. `internal/advisor` takes plain inpu
 
 ## Commands
 - Test: `go test ./...`
-- Benchmark: `go test -bench=. ./internal/eval`
+- Benchmark: `go test -bench=. ./internal/...`
 - WASM build: `GOOS=js GOARCH=wasm go build -o web/main.wasm ./wasm`

@@ -10,7 +10,7 @@ Work in progress. See [CLAUDE.md](CLAUDE.md) for the full plan and milestones.
 | --- | --- | --- |
 | `internal/card` | Cards, parsing (`"As"`, `"Td"`), and a seedable deck | Done |
 | `internal/eval` | Ranks any 5 to 7 cards; fast bitmask evaluator plus a naive reference | Done |
-| `internal/equity` | Monte Carlo equity against one or more random hands, across all cores | Planned |
+| `internal/equity` | Exact and Monte Carlo equity, heads-up or multiway, across all cores | Done |
 | `internal/advisor` | Recommends fold, call or raise for your spot, with the reasoning | Planned |
 | `internal/game` | Plays heads-up no-limit hands (blinds, four streets, showdown) and matches | Planned |
 | `internal/bot` | `RandomBot` and `EquityBot` that play the game engine | Planned |
@@ -24,7 +24,7 @@ Needs Go 1.27 or newer.
 ```bash
 go test ./...                       # all tests, including exhaustive all-hands checks (a few seconds)
 go test -short ./...                # quick run that skips the exhaustive checks
-go test -bench=. ./internal/eval    # evaluator benchmarks
+go test -bench=. ./internal/...      # evaluator and equity benchmarks
 go doc ./internal/eval              # package documentation
 ```
 
@@ -95,3 +95,57 @@ Median of 5 runs, `go test -bench=. -count=5 ./internal/eval`, Apple M2 Pro, Go 
 | 7 cards | 1,813 ns | 31 ns | 59x |
 
 At 31 ns per 7-card hand, one core ranks about 32 million hands per second. Neither evaluator allocates memory.
+
+## Equity calculator (`internal/equity`)
+
+Equity is a hand's average share of the pot: 100% always wins, and a two-way split counts as half a win. `Calculate` takes the known hole cards, the board so far, and how many extra opponents hold unknown cards.
+
+```go
+aces, _ := card.ParseCards("AhAs")
+kings, _ := card.ParseCards("KdKc")
+r, err := equity.Calculate(ctx, equity.Request{Hands: [][]card.Card{aces, kings}})
+// r.Exact == true, r.Deals == 1712304 (every possible board)
+// r.Hands[0]: win 81.06%, tie 0.38%, equity 81.26%
+
+hand, _ := card.ParseCards("AsKd")
+board, _ := card.ParseCards("Qs Jh 2c")
+r, err = equity.Calculate(ctx, equity.Request{
+	Hands: [][]card.Card{hand}, Board: board, Opponents: 2, Seed: 1,
+})
+// Monte Carlo against two random hands: equity about 43.8%
+```
+
+| Name | What it does |
+| --- | --- |
+| `Calculate(ctx, req)` | Returns each known hand's equity, win rate and tie rate; stops early with an error if `ctx` is cancelled |
+| `Request.Hands` | Known hole cards, two per hand; results come back in the same order |
+| `Request.Board` | Board cards so far: 0 (preflop), 3, 4 or 5 |
+| `Request.Opponents` | Extra players with unknown cards; up to 10 players in total |
+| `Request.Method` | `Auto` (default), `Exact` or `MonteCarlo` |
+| `Request.Trials`, `Request.Seed` | Monte Carlo trial count (default 100,000) and seed; the same seed always gives the same result |
+| `Request.Workers` | Goroutines to use; default is one per CPU core, and the result never depends on it |
+| `Result.Hands[i]` | `Equity`, `Win` and `Tie` for known hand `i`, each from 0 to 1 |
+| `Result.Exact`, `Result.Deals` | Which method ran, and how many boards it evaluated |
+
+**How it chooses a method.** When every hand is known, `Auto` enumerates every remaining board exactly. Even preflop heads-up, that's only 1.7 million boards. With random opponents it uses Monte Carlo: it deals random boards and opponent hands many times and averages the results. 100,000 trials land within about 0.3 percentage points of the true value.
+
+**How it uses every core.** The work is cut into many small jobs. For Monte Carlo, a job is a chunk of 4,096 trials. For exact enumeration, it's every board that starts with a given pair of cards. Goroutines take jobs from a shared atomic counter until none are left. Each job keeps its own tally, so the hot loop never takes a lock. Each Monte Carlo chunk seeds its own random generator from `(Seed, chunk number)`, and tallies are added up in job order. That's why the result is identical on 1 core or 10.
+
+**How it's tested.** Exact preflop results match [published exact enumerations](https://www.deucescracked.com/blog/preflop-poker-equity-matchups-exact-data) for five matchups, to the two decimals published (e.g. AhAs vs KdKc: 81.06% win, 0.38% tie). Other tests cover:
+- a flush draw on the turn that must equal exactly 9/44
+- split pots where the board plays
+- Monte Carlo agreeing with exact enumeration
+- identical results with 1, 3 and 8 workers
+- aces against one random hand coming out at about 85.2%
+- cancellation and every kind of invalid request
+
+### Performance
+
+Median of 5 runs, `go test -bench=. -count=5 ./internal/equity`, Apple M2 Pro (6 performance + 4 efficiency cores), Go 1.27:
+
+| Job | 1 core | 10 cores | Speedup |
+| --- | ---: | ---: | ---: |
+| Exact, preflop heads-up (1,712,304 boards) | 96 ms | 15 ms | 6.2x |
+| Monte Carlo, 100,000 trials vs 3 random hands | 18.4 ms | 3.1 ms | 5.9x |
+
+The speedup tops out around 6x because the efficiency cores are much slower than the performance cores. An earlier version split exact enumeration on only the first new board card. That gave 44 uneven jobs and a 4.4x speedup. Splitting on the first two cards gives about a thousand jobs and brought it to 6.2x.
