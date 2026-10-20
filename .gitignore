@@ -1,6 +1,14 @@
-__pycache__/
-*.egg-info/
-.pytest_cache/
-.venv/
-build/
-dist/
+# Build output
+/bin/
+*.exe
+*.test
+*.out
+
+# WASM build artifact (rebuilt from ./wasm)
+web/main.wasm
+
+# Profiling and coverage
+*.prof
+coverage.*
+
+.DS_Store
