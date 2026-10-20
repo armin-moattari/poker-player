@@ -20,6 +20,7 @@ A Texas Hold'em hand evaluator and equity calculator written in Go, compiled to 
 - **Comment and document code well.** Every package gets a package doc, every exported identifier a doc comment, and non-obvious logic (bit tricks, invariants, why a choice was made) an inline comment. Check the result with `go doc`.
 - Keep packages small and modular. Suggest a refactor when a file or function grows unwieldy.
 - Run `go test ./...` (and `go vet ./...`) before every commit. Never commit failing tests. Use `go test -short ./...` for a fast loop; it skips the exhaustive all-hands checks.
+- **Keep the README current.** When a package lands or changes, update its row in "What's here" and its section: a short example and a table describing each exported function. Back README examples with `Example` tests so they stay correct.
 - Show the proposed commit message and wait for approval before committing. Use small, focused commits with conventional-style messages (e.g. `feat(eval): rank five-card hands`).
 - Explain *why* when recommending a change, briefly.
 
