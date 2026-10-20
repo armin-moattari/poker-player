@@ -9,6 +9,9 @@ description = "A heads-up Texas Hold'em engine and simple bots"
 readme = "README.md"
 requires-python = ">=3.11"
 
+[project.scripts]
+poker-advisor = "poker_bot.advisor:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
