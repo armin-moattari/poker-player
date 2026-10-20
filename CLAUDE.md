@@ -16,7 +16,8 @@ A Texas Hold'em hand evaluator and equity calculator written in Go, compiled to 
 - Concurrent Monte Carlo equity simulation across cores.
 
 ## How we work together
-- **Armin writes the core logic and the first tests.** Claude explains concepts, reviews code, suggests structure, and adds edge-case tests. Do not write core evaluator/equity logic unless explicitly asked.
+- **Claude writes the code, including core evaluator/equity logic and tests** (Armin asked for this on 2026-10-20). Explain the key design choices in each change so Armin can learn from and review it.
+- **Comment and document code well.** Every package gets a package doc, every exported identifier a doc comment, and non-obvious logic (bit tricks, invariants, why a choice was made) an inline comment. Check the result with `go doc`.
 - Keep packages small and modular. Suggest a refactor when a file or function grows unwieldy.
 - Run `go test ./...` (and `go vet ./...`) before every commit. Never commit failing tests.
 - Show the proposed commit message and wait for approval before committing. Use small, focused commits with conventional-style messages (e.g. `feat(eval): rank five-card hands`).
